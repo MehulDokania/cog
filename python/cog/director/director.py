@@ -1,3 +1,4 @@
+import datetime
 import json
 import queue
 import signal
@@ -6,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 import structlog
+from opentelemetry import trace
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry  # type: ignore
 
@@ -14,6 +16,7 @@ from ..server.probes import ProbeHelper
 from ..server.webhook import requests_session, webhook_caller
 from .eventtypes import Health, HealthcheckStatus, Webhook
 from .healthchecker import Healthchecker
+from .monitor import Monitor
 from .prediction_tracker import PredictionTracker
 from .redis import EmptyRedisStream, RedisConsumer
 
@@ -48,6 +51,7 @@ class Director:
         self,
         events: queue.Queue,
         healthchecker: Healthchecker,
+        monitor: Monitor,
         redis_consumer: RedisConsumer,
         predict_timeout: int,
         max_failure_count: int,
@@ -55,6 +59,7 @@ class Director:
     ):
         self.events = events
         self.healthchecker = healthchecker
+        self.monitor = monitor
         self.redis_consumer = redis_consumer
         self.predict_timeout = predict_timeout
         self.max_failure_count = max_failure_count
@@ -63,6 +68,7 @@ class Director:
         self._failure_count = 0
         self._should_exit = False
         self._shutdown_hooks: List[Callable] = []
+        self._tracer = trace.get_tracer("cog-director")
 
         self.cog_client = _make_local_http_client()
         self.cog_http_base = "http://localhost:5000"
@@ -157,6 +163,8 @@ class Director:
             structlog.contextvars.bind_contextvars(
                 queue=self.redis_consumer.redis_input_queue,
             )
+            self.monitor.set_current_prediction(None)
+            started_idling_at = datetime.datetime.utcnow()
 
             self._confirm_model_health()
 
@@ -174,7 +182,16 @@ class Director:
 
             try:
                 log.info("received message")
-                self._handle_message(message_id, message_json)
+                span_attributes = {
+                    "idling_ms": (
+                        datetime.datetime.utcnow() - started_idling_at
+                    ).total_seconds()
+                    * 1000,
+                }
+                with self._tracer.start_as_current_span(
+                    name="cog.prediction", attributes=span_attributes
+                ) as span:
+                    self._handle_message(message_id, message_json, span)
             except Exception:
                 self._record_failure()
                 log.error("caught exception while running prediction", exc_info=True)
@@ -184,7 +201,9 @@ class Director:
                 self.redis_consumer.ack(message_id)
                 log.info("acked message")
 
-    def _handle_message(self, message_id: str, message_json: str) -> None:
+    def _handle_message(
+        self, message_id: str, message_json: str, span: trace.Span
+    ) -> None:
         message = json.loads(message_json)
         prediction_id = message["id"]
 
@@ -194,7 +213,6 @@ class Director:
         )
 
         log.info("running prediction")
-        should_cancel = self.redis_consumer.checker(message.get("cancel_key"))
 
         # Tracker is tied to a single prediction, and deliberately only exists
         # within this method in an attempt to eliminate the possibility that we
@@ -203,6 +221,10 @@ class Director:
             response=schema.PredictionResponse(**message),
             webhook_caller=webhook_caller(message["webhook"]),
         )
+        self.monitor.set_current_prediction(tracker._response)
+        self._set_span_attributes_from_tracker(span, tracker)
+
+        should_cancel = self.redis_consumer.checker(message.get("cancel_key"))
 
         # Override webhook to call us
         message["webhook"] = "http://localhost:4900/webhook"
@@ -240,6 +262,7 @@ class Director:
                     response=resp.text,
                 )
             self._record_failure()
+            span.set_attribute("prediction.status", "failure")
             return
 
         tracker.start()
@@ -269,6 +292,7 @@ class Director:
             if should_cancel():
                 log.info("prediction cancelation requested")
                 self._cancel_prediction(prediction_id)
+                span.set_attribute("prediction.status", "cancelled")
                 break
 
             if self.predict_timeout and tracker.runtime > self.predict_timeout:
@@ -280,6 +304,7 @@ class Director:
                 # cancelation webhook appropriately.
                 tracker.timed_out()
                 self._cancel_prediction(prediction_id)
+                span.set_attribute("prediction.status", "timeout")
                 break
 
         # Wait up to another CANCEL_WAIT seconds for cancelation if necessary
@@ -311,6 +336,28 @@ class Director:
         else:
             log.info("prediction succeeded")
             self._record_success()
+
+        self._set_span_attributes_from_tracker(span, tracker)
+
+    # OpenTelemetry is very picky about not accepting None types
+    def _set_span_attributes_from_tracker(self, span, tracker):
+        span.set_attribute("prediction.id", tracker._response.id)
+        if tracker._response.version:
+            span.set_attribute("prediction.model.version", tracker._response.version)
+        if tracker._response.started_at:
+            span.set_attribute(
+                "prediction.started_at", tracker._response.started_at.timestamp()
+            )
+        if tracker._response.created_at:
+            span.set_attribute(
+                "prediction.created_at", tracker._response.created_at.timestamp()
+            )
+        if tracker._response.status:
+            span.set_attribute("prediction.status", tracker.status)
+        if tracker._response.completed_at:
+            span.set_attribute(
+                "prediction.completed_at", tracker._response.completed_at.timestamp()
+            )
 
     def _confirm_model_health(self) -> None:
         self.healthchecker.request_status()
